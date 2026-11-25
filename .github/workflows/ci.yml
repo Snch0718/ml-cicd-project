@@ -64,7 +64,9 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/snch0718/ml-cicd-project:latest
+          tags: |
+            ghcr.io/snch0718/ml-cicd-project:latest
+            ghcr.io/snch0718/ml-cicd-project:${{ github.sha }}
 
   deploy:
     name: Deploy to AWS EC2
