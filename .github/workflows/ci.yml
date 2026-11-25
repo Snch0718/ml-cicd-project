@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 jobs:
+  # JOB 1: Continuous Integration
   test:
     name: Run Python Tests
     runs-on: ubuntu-latest
@@ -35,6 +36,7 @@ jobs:
       - name: Run pytest
         run: python -m pytest -v
 
+  # JOB 2: Build and Push Docker Image
   build-and-push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
@@ -68,6 +70,7 @@ jobs:
             ghcr.io/snch0718/ml-cicd-project:latest
             ghcr.io/snch0718/ml-cicd-project:${{ github.sha }}
 
+  # JOB 3: Deploy to AWS EC2
   deploy:
     name: Deploy to AWS EC2
     runs-on: ubuntu-latest
@@ -99,13 +102,88 @@ jobs:
           role-to-assume: arn:aws:iam::195275635591:role/GitHubActions-EC2-Deploy
           aws-region: us-east-1
 
-      - name: Deploy application through SSM
+      - name: Deploy, verify, and rollback if necessary
+        env:
+          IMAGE: ghcr.io/snch0718/ml-cicd-project:${{ github.sha }}
         run: |
+          REMOTE_SCRIPT=$(cat <<'REMOTE'
+          set -Eeuo pipefail
+
+          IMAGE="__IMAGE__"
+          OLD_IMAGE=""
+          DEPLOY_STARTED=0
+
+          if docker inspect iris-api >/dev/null 2>&1; then
+            OLD_IMAGE=$(docker inspect --format '{{.Config.Image}}' iris-api)
+            echo "Previous image: $OLD_IMAGE"
+          fi
+
+          rollback() {
+            EXIT_CODE=$?
+
+            if [ "$EXIT_CODE" -ne 0 ] && [ "$DEPLOY_STARTED" -eq 1 ]; then
+              echo "Deployment failed. Rolling back..."
+
+              docker rm -f iris-api || true
+
+              if [ -n "$OLD_IMAGE" ]; then
+                docker run -d \
+                  --name iris-api \
+                  --restart unless-stopped \
+                  -p 8000:8000 \
+                  "$OLD_IMAGE"
+
+                echo "Rollback completed."
+              else
+                echo "No previous deployment available to restore."
+              fi
+            fi
+          }
+
+          trap rollback EXIT
+
+          echo "Pulling new image..."
+          docker pull "$IMAGE"
+
+          echo "Stopping previous container..."
+          docker rm -f iris-api || true
+          DEPLOY_STARTED=1
+
+          echo "Starting new container..."
+          docker run -d \
+            --name iris-api \
+            --restart unless-stopped \
+            -p 8000:8000 \
+            "$IMAGE"
+
+          echo "Waiting for API health check..."
+
+          for i in {1..15}; do
+            if curl -fsS http://localhost:8000/health; then
+              echo "Deployment verified successfully!"
+              trap - EXIT
+              exit 0
+            fi
+
+            echo "Health check attempt $i failed. Retrying..."
+            sleep 2
+          done
+
+          echo "Health check failed after 30 seconds."
+          exit 1
+          REMOTE
+          )
+
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__IMAGE__/$IMAGE}"
+
+          PARAMETERS=$(jq -n --arg script "$REMOTE_SCRIPT" \
+            '{commands: [$script]}')
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids i-0dc0ab3108940e06a \
             --document-name AWS-RunShellScript \
-            --comment "Deploy latest ML API Docker image" \
-            --parameters '{"commands":["set -e","docker pull ghcr.io/snch0718/ml-cicd-project:latest","docker rm -f iris-api || true","docker run -d --name iris-api --restart unless-stopped -p 8000:8000 ghcr.io/snch0718/ml-cicd-project:latest"]}' \
+            --comment "Deploy, verify, and rollback ML API" \
+            --parameters "$PARAMETERS" \
             --query "Command.CommandId" \
             --output text)
 
@@ -140,5 +218,5 @@ jobs:
             sleep 10
           done
 
-          echo "Deployment timed out."
+          echo "Deployment monitoring timed out."
           exit 1
